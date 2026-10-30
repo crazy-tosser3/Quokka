@@ -1,0 +1,14 @@
+.git
+.idea
+build
+cmake-build-*
+dist
+src/Dockerfile
+src/.gitignore
+
+# ключи не должны попадать в образ — монтируйте их при запуске
+*.key
+*.crt
+*.pem
+tests/__pycache__
+.backup

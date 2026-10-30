@@ -1,0 +1,14 @@
+build
+cmake-build-*
+dist
+
+.idea
+.vscode
+cmake-build-debug
+*.key
+*.crt
+*.pem
+*.p12
+
+# Локальные копии перед крупными изменениями
+.backup
