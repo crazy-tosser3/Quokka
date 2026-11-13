@@ -1,6 +1,7 @@
 ARG DEBIAN_VERSION=trixie
 
 FROM debian:${DEBIAN_VERSION}-slim AS toolchain
+
 ARG TARGETARCH
 ARG CMAKE_VERSION=4.2.3
 
@@ -8,6 +9,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential g++ ninja-build git ca-certificates curl patchelf \
         libboost-dev libssl-dev \
+        dpkg-dev \
  && rm -rf /var/lib/apt/lists/*
 
 RUN case "${TARGETARCH}" in \
@@ -21,6 +23,7 @@ RUN case "${TARGETARCH}" in \
  && cmake --version
 
 FROM toolchain AS msquic
+
 ARG MSQUIC_VERSION=v2.6.3
 
 RUN git clone --depth 1 --branch "${MSQUIC_VERSION}" https://github.com/microsoft/msquic.git /src/msquic \
@@ -40,11 +43,13 @@ RUN git clone --depth 1 --branch "${MSQUIC_VERSION}" https://github.com/microsof
  && rm -rf /src/msquic
 
 FROM toolchain AS build
+
 ARG BUILD_TYPE=Release
 
 COPY --from=msquic /opt/msquic /opt/msquic
 
 WORKDIR /src/quokka
+
 COPY CMakeLists.txt ./
 COPY src ./src
 COPY tests ./tests
@@ -60,8 +65,12 @@ RUN cmake -S . -B build -G Ninja \
  && patchelf --set-rpath '$ORIGIN' /out/quokka \
  && ldd /out/quokka
 
-# Тесты на Linux: docker build --target test .
+# Тесты на Linux:
+# docker build --target test .
 FROM build AS test
+
+ARG BUILD_TYPE=Release
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 procps \
  && rm -rf /var/lib/apt/lists/* \
@@ -72,24 +81,87 @@ RUN apt-get update \
  && cmake --build build-test \
  && LD_LIBRARY_PATH=/opt/msquic/lib ctest --test-dir build-test --output-on-failure
 
-FROM scratch AS export
-COPY --from=build /out/ /
-
-FROM debian:${DEBIAN_VERSION}-slim AS runtime
+# Настоящий NAT: tests/nat_test.sh
+FROM debian:${DEBIAN_VERSION}-slim AS nat-test
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl3t64 libstdc++6 ca-certificates \
+ && apt-get install -y --no-install-recommends \
+        libssl3t64 libstdc++6 iproute2 iptables conntrack python3 procps \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/ /opt/quokka/
+
+RUN ln -s /opt/quokka/quokka /usr/local/bin/quokka
+
+# Экспорт бинарников и библиотек
+FROM scratch AS export
+
+COPY --from=build /out/ /
+
+# Сборка Debian-пакета
+FROM build AS deb
+
+ARG PACKAGE_VERSION=1.0.0
+ARG PACKAGE_MAINTAINER="Quokka Team <dev@example.com>"
+
+RUN set -eux; \
+    DEB_ARCH="$(dpkg --print-architecture)"; \
+    PKG_DIR="/tmp/quokka_${PACKAGE_VERSION}_${DEB_ARCH}"; \
+    mkdir -p \
+        "${PKG_DIR}/DEBIAN" \
+        "${PKG_DIR}/usr/lib/quokka" \
+        "${PKG_DIR}/usr/bin"; \
+    \
+    cp /out/quokka "${PKG_DIR}/usr/lib/quokka/"; \
+    cp -P /out/libmsquic.so* "${PKG_DIR}/usr/lib/quokka/"; \
+    ln -s ../lib/quokka/quokka "${PKG_DIR}/usr/bin/quokka"; \
+    \
+    printf '%s\n' \
+        "Package: quokka" \
+        "Version: ${PACKAGE_VERSION}" \
+        "Section: net" \
+        "Priority: optional" \
+        "Architecture: ${DEB_ARCH}" \
+        "Maintainer: ${PACKAGE_MAINTAINER}" \
+        "Depends: libc6, libgcc-s1, libstdc++6, libssl3t64, ca-certificates" \
+        "Description: Quokka networking application" \
+        " A lightweight networking application based on MsQuic." \
+        > "${PKG_DIR}/DEBIAN/control"; \
+    \
+    mkdir -p /out/deb; \
+    dpkg-deb --build --root-owner-group \
+        "${PKG_DIR}" \
+        "/out/deb/quokka_${PACKAGE_VERSION}_${DEB_ARCH}.deb"; \
+    \
+    dpkg-deb --info "/out/deb/quokka_${PACKAGE_VERSION}_${DEB_ARCH}.deb"
+
+# Экспорт Debian-пакета
+FROM scratch AS export-deb
+
+COPY --from=deb /out/deb/ /
+
+# Runtime-контейнер
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libssl3t64 libstdc++6 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/ /opt/quokka/
+
 RUN ln -s /opt/quokka/quokka /usr/local/bin/quokka \
  && useradd --system --no-create-home quokka \
  && mkdir -m 700 /data \
  && chown quokka /data
 
-# Личность point и сохранённый код живут в томе, чтобы переживать пересоздание контейнера
+# Ключи узла и сохранённые сети живут в томе,
+# чтобы переживать пересоздание контейнера
 ENV QUOKKA_HOME=/data
+
 VOLUME /data
+
 USER quokka
 WORKDIR /data
+
 ENTRYPOINT ["quokka"]

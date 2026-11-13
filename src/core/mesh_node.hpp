@@ -3,6 +3,7 @@
 #include "core/config.hpp"
 #include "core/discovery.hpp"
 #include "core/identity.hpp"
+#include "core/pairing.hpp"
 #include "core/protocol.hpp"
 #include "core/quic_session.hpp"
 #include "core/quic_stream.hpp"
@@ -32,12 +33,22 @@
 // открывает свои сервисы, пользуется чужими и передаёт транзитный трафик.
 class MeshNode final : private QuicSession::Events {
 public:
-    MeshNode(boost::asio::io_context& io, const NodeConfig& config, Stats& stats,
+    MeshNode(boost::asio::io_context& io, const NodeConfig& config, Stats& stats, const identity::Invite& network,
              const identity::NetworkKeys& keys, const identity::NodeIdentity& self);
     ~MeshNode() override;
 
     NodeStatus status() const;
     uint16_t quic_port() const { return quic_port_; }
+
+    struct InviteInfo {
+        std::string code;
+        std::chrono::seconds ttl;
+        unsigned uses;
+        std::string host;  // куда подключаться новому устройству; пусто, если только локальная сеть
+    };
+    // В потоке io_context или до его запуска
+    InviteInfo create_invite(std::chrono::seconds ttl, unsigned uses);
+    std::string status_text() const;
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -162,6 +173,7 @@ private:
     NodeConfig config_;
     Stats& stats_;
     identity::NodeIdentity self_;
+    pairing::Service pairing_;
     QuicSession::Context sessions_;
     HQUIC quic_listener_{nullptr};
     uint16_t quic_port_{0};

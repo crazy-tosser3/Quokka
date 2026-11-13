@@ -1,8 +1,12 @@
 #include "app/app.hpp"
 #include "app/cli.hpp"
+#include "app/profiles.hpp"
+#include "core/control.hpp"
 #include "core/identity.hpp"
 #include "core/log.hpp"
 #include "core/net_utils.hpp"
+#include "core/pairing.hpp"
+#include "core/pake.hpp"
 #include "core/routing.hpp"
 
 #include <boost/asio/io_context.hpp>
@@ -13,9 +17,15 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 namespace {
+
+constexpr auto DEFAULT_INVITE_TTL = std::chrono::minutes(15);
+constexpr auto LAN_SEARCH_TIME = std::chrono::seconds(6);
+constexpr int MAX_JOIN_ATTEMPTS = 3;
+constexpr std::string_view DEFAULT_PROFILE = "default";
 
 std::string services_text(const NodeConfig& config) {
     if (config.services.empty()) return "нет";
@@ -36,53 +46,263 @@ std::string default_name() {
     return routing::is_valid_name(name) ? name : std::string{};
 }
 
-// up: сеть уже есть, если этот узел в неё входил; иначе создаём новую
-identity::Invite prepare_up(const CliOptions& opts) {
-    const auto dir = identity::state_dir();
-    if (!opts.new_invite) {
-        if (const auto saved = identity::load_saved_invite(dir)) return *saved;
-    }
-    const auto invite = identity::make_invite();
-    identity::save_invite(dir, invite);
-    return invite;
+std::string ttl_text(std::chrono::seconds ttl) {
+    if (ttl.count() % 3600 == 0) return std::to_string(ttl.count() / 3600) + " ч";
+    if (ttl.count() % 60 == 0) return std::to_string(ttl.count() / 60) + " мин";
+    return std::to_string(ttl.count()) + " с";
 }
 
-std::optional<identity::Invite> read_invite(const CliOptions& opts) {
-    if (opts.invite) return identity::decode_invite(*opts.invite);
-    if (const char* env = std::getenv("QUOKKA_INVITE"); env && *env) return identity::decode_invite(env);
-    if (auto saved = identity::load_saved_invite(identity::state_dir())) return saved;
-    if (!isatty(STDIN_FILENO)) return std::nullopt;
+std::string invite_text(const std::string& code, std::chrono::seconds ttl, unsigned uses, const std::string& host,
+                        const NodeConfig& config) {
+    std::string command = "quokka join " + code;
+    if (!host.empty()) command += " --peer " + host;
+    for (const Service& service : config.services) command += " --open " + std::to_string(service.port);
 
-    std::cout << "Введите код приглашения: " << std::flush;
-    std::string line;
-    std::getline(std::cin, line);
-    return identity::decode_invite(line);
+    std::ostringstream out;
+    out << "Код приглашения: " << code << "  (действует " << ttl_text(ttl) << ", устройств: " << uses << ")\n\n"
+        << "На новом устройстве выполните:\n\n"
+        << "    " << command << "\n\n";
+    if (host.empty()) {
+        out << "Без --peer устройство найдёт узел только в локальной сети. Если он доступен извне,\n"
+               "запустите его с --public АДРЕС, чтобы адрес подставлялся сам.\n\n";
+    }
+    return out.str();
 }
 
-identity::Invite prepare_join(const CliOptions& opts) {
-    const auto invite = read_invite(opts);
-    if (!invite) {
-        throw std::runtime_error("Код приглашения не указан или повреждён. Скопируйте его целиком с любого узла сети.");
-    }
-    if (!opts.no_save) identity::save_invite(identity::state_dir(), *invite);
+// --- Какую сеть запускать ---
+
+struct Selected {
+    identity::Invite network;
+    NodeConfig config;
+    bool created = false;
+    std::string profile;
+};
+
+identity::Invite decode_saved(const Profile& profile) {
+    const auto invite = identity::decode_invite(profile.code);
+    if (!invite) throw std::runtime_error("Ключ сети в файле настроек повреждён");
     return *invite;
 }
 
-void print_banner(const CliOptions& opts, const App& app, const identity::Invite& invite, const identity::NodeIdentity& self) {
-    const auto& config = opts.config;
-    std::string join_command = "quokka join " + identity::encode_invite(invite);
-    for (const Service& service : config.services) {
-        join_command += " --open " + std::to_string(service.port);
+Selected select_up(const CliOptions& opts) {
+    auto file = load_profiles();
+    std::string name = opts.profile;
+    if (name.empty()) name = file.default_name.empty() ? std::string(DEFAULT_PROFILE) : file.default_name;
+
+    Selected selected;
+    selected.profile = name;
+    selected.config = opts.config;
+    const auto existing = file.profiles.find(name);
+    if (existing != file.profiles.end() && !opts.new_invite) {
+        selected.network = decode_saved(existing->second);
+        if (!opts.profile.empty()) save_profile(name, Profile{identity::encode_invite(selected.network), opts.config}, false);
+    } else {
+        selected.network = identity::make_invite();
+        selected.created = true;
+        save_profile(name, Profile{identity::encode_invite(selected.network), opts.config},
+                     file.default_name.empty() || file.default_name == name);
+    }
+    return selected;
+}
+
+std::string read_code_interactively() {
+    if (!isatty(STDIN_FILENO)) return {};
+    std::cout << "Введите код приглашения: " << std::flush;
+    std::string line;
+    std::getline(std::cin, line);
+    return line;
+}
+
+// Короткий код меняем на настоящий ключ сети: сначала у указанных адресов, затем в локальной сети
+identity::Invite pair_with_code(const std::string& code, const NodeConfig& config) {
+    std::vector<pairing::LanHost> hosts;
+    for (const PeerAddress& peer : config.peers) hosts.push_back({peer.host, peer.port});
+
+    int wrong = 0;
+    const auto try_host = [&](const pairing::LanHost& host) -> std::optional<identity::Invite> {
+        std::cout << "Вход через " << host.host << ":" << host.port << "..." << std::endl;
+        const auto outcome = pairing::join(host.host, host.port, code);
+        if (outcome.result == pairing::Result::Ok && outcome.invite) return outcome.invite;
+        if (outcome.result == pairing::Result::WrongCode) ++wrong;
+        return std::nullopt;
+    };
+
+    for (const auto& host : hosts) {
+        if (wrong >= MAX_JOIN_ATTEMPTS) break;
+        if (auto invite = try_host(host)) return *invite;
+    }
+    if (config.discovery && wrong < MAX_JOIN_ATTEMPTS) {
+        std::cout << "Ищу узел с кодом в локальной сети..." << std::endl;
+        for (const auto& host : pairing::find_on_lan(config.multicast_ip, config.discovery_port, LAN_SEARCH_TIME)) {
+            if (wrong >= MAX_JOIN_ATTEMPTS) break;
+            if (auto invite = try_host(host)) return *invite;
+        }
     }
 
-    std::cout << "Quokka: узел " << (config.name.empty() ? "" : config.name + " ") << "(" << identity::short_id(self.id) << ")\n"
-              << "  Свои сервисы: " << services_text(config) << "\n"
-              << "  Входящие:     " << (config.max_listeners ? "до " + std::to_string(*config.max_listeners) : "без ограничений") << "\n"
-              << "  QUIC-порт:    " << app.status().quic_port << "/udp\n\n"
-              << "Чтобы добавить устройство в сеть, выполните на нём:\n\n"
-              << "    " << join_command << "\n\n"
-              << "Код — это пропуск в сеть: передавайте его только тем, кого хотите пустить.\n"
-              << std::endl;
+    if (wrong > 0) {
+        throw std::runtime_error("Код не подошёл: он неверный, уже использован или истёк. Попросите новый: quokka invite");
+    }
+    if (config.peers.empty()) {
+        throw std::runtime_error("Не нашёл узел с кодом в локальной сети. Если он в другой сети, укажите адрес: --peer АДРЕС");
+    }
+    throw std::runtime_error("Узел недоступен, или код уже использован или истёк. Проверьте адрес и UDP-порт 30002, "
+                             "при необходимости запросите новый код: quokka invite");
+}
+
+Selected select_join(const CliOptions& opts) {
+    std::string text = opts.invite.value_or("");
+    if (text.empty()) {
+        if (const char* env = std::getenv("QUOKKA_INVITE"); env && *env) text = env;
+    }
+    if (text.empty()) text = read_code_interactively();
+    if (text.empty()) throw std::runtime_error("Код приглашения не указан. Его можно получить на любом узле: quokka invite");
+
+    Selected selected;
+    selected.config = opts.config;
+    if (const auto code = pake::normalize_code(text)) {
+        selected.network = pair_with_code(*code, opts.config);
+    } else if (const auto full = identity::decode_invite(text)) {
+        selected.network = *full;
+    } else {
+        throw std::runtime_error("Код приглашения повреждён: проверьте опечатки. Он выглядит как ABC-DEF-GHJ");
+    }
+    if (opts.no_save) return selected;
+
+    // Запоминаем сеть, чтобы дальше хватало команды quokka
+    const auto file = load_profiles();
+    const std::string code_text = identity::encode_invite(selected.network);
+    std::string name = opts.profile;
+    if (name.empty()) {
+        for (const auto& [existing, profile] : file.profiles) {
+            if (profile.code == code_text) name = existing;
+        }
+    }
+    if (name.empty()) {
+        name = std::string(DEFAULT_PROFILE);
+        for (int i = 2; file.profiles.contains(name); ++i) name = "network" + std::to_string(i);
+    }
+    selected.profile = name;
+    const auto existing = file.profiles.find(name);
+    if (opts.profile.empty() && existing != file.profiles.end() && existing->second.code == code_text) {
+        return selected;  // уже сохранена: настройки меняются только явно через --save
+    }
+    save_profile(name, Profile{code_text, opts.config}, file.default_name.empty());
+    std::cout << "Сеть сохранена как '" << name << "'. В следующий раз хватит команды: quokka connect " << name << std::endl;
+    return selected;
+}
+
+Selected select_saved(const std::string& name, const NodeConfig& config) {
+    const auto file = load_profiles();
+    const auto it = file.profiles.find(name);
+    if (it == file.profiles.end()) throw std::runtime_error("Сети '" + name + "' нет. Посмотреть список: quokka list");
+    return Selected{decode_saved(it->second), config, false, name};
+}
+
+// quokka без аргументов: одна сеть запускается сразу, из нескольких можно выбрать
+std::string choose_profile() {
+    const auto file = load_profiles();
+    if (file.profiles.empty()) return {};
+    if (file.profiles.size() == 1) return file.profiles.begin()->first;
+    if (!isatty(STDIN_FILENO)) {
+        if (!file.default_name.empty()) return file.default_name;
+        throw std::runtime_error("Сетей несколько: укажите нужную, quokka connect ИМЯ");
+    }
+
+    std::cout << "Сети:\n";
+    std::vector<std::string> names;
+    for (const auto& [name, profile] : file.profiles) {
+        names.push_back(name);
+        std::cout << "  " << names.size() << ") " << name << (name == file.default_name ? " (по умолчанию)" : "");
+        if (!profile.config.peers.empty()) std::cout << "  через " << profile.config.peers.front().host;
+        std::cout << "\n";
+    }
+    std::cout << "Куда подключиться? [" << (file.default_name.empty() ? "1" : file.default_name) << "]: " << std::flush;
+    std::string line;
+    std::getline(std::cin, line);
+    if (line.empty()) return file.default_name.empty() ? names.front() : file.default_name;
+    if (file.profiles.contains(line)) return line;
+    const std::size_t index = static_cast<std::size_t>(std::atoi(line.c_str()));
+    if (index < 1 || index > names.size()) throw std::runtime_error("Нет такой сети");
+    return names[index - 1];
+}
+
+void print_list() {
+    const auto file = load_profiles();
+    std::cout << "Файл настроек: " << config_path().string() << "\n\n";
+    if (file.profiles.empty()) {
+        std::cout << "Сохранённых сетей нет. Создать: quokka up. Войти: quokka join КОД\n";
+        return;
+    }
+    for (const auto& [name, profile] : file.profiles) {
+        const NodeConfig& c = profile.config;
+        std::cout << name << (name == file.default_name ? " (по умолчанию)" : "") << "\n";
+        if (!c.name.empty()) std::cout << "  имя узла:  " << c.name << "\n";
+        for (const PeerAddress& peer : c.peers) std::cout << "  сосед:     " << peer.host << ":" << peer.port << "\n";
+        if (!c.services.empty()) std::cout << "  сервисы:   " << services_text(c) << "\n";
+        for (const OpenRule& rule : c.open_rules) {
+            std::cout << "  открывает: " << (rule.port == 0 ? "все сервисы" : (rule.node.empty() ? "" : rule.node + ":") + std::to_string(rule.port));
+            if (rule.local_port != 0) std::cout << " на порту " << rule.local_port;
+            std::cout << "\n";
+        }
+        if (!c.relay) std::cout << "  транзит:   выключен\n";
+        if (!c.discovery) std::cout << "  автопоиск: выключен\n";
+    }
+}
+
+// --- Команды для работающего узла ---
+
+int run_invite(const CliOptions& opts) {
+    if (opts.invite_full) {
+        const auto file = load_profiles();
+        const auto it = file.profiles.find(file.default_name);
+        if (it == file.profiles.end()) throw std::runtime_error("Сохранённых сетей нет");
+        std::cout << it->second.code << std::endl;
+        return 0;
+    }
+    std::ostringstream request;
+    request << "invite " << opts.invite_ttl.count() << " " << opts.invite_uses;
+    const auto response = control_request(identity::state_dir() / "control.sock", request.str());
+    if (!response) throw std::runtime_error("Узел не запущен: код выдаёт работающий узел. Запустите quokka up");
+
+    std::istringstream parts(*response);
+    std::string code, host;
+    unsigned long seconds = 0;
+    unsigned uses = 0;
+    parts >> code >> seconds >> uses >> host;
+    if (code == "error" || code.empty()) throw std::runtime_error("Не удалось выдать код");
+    std::cout << invite_text(code, std::chrono::seconds(seconds), uses, host, NodeConfig{}) << std::flush;
+    return 0;
+}
+
+int run_status() {
+    const auto response = control_request(identity::state_dir() / "control.sock", "status");
+    if (!response) {
+        std::cerr << "Узел не запущен\n";
+        return 1;
+    }
+    std::cout << *response;
+    return 0;
+}
+
+void print_banner(const NodeConfig& config, App& app, const identity::NodeIdentity& self, const Selected& selected, bool issue_code) {
+    std::ostringstream out;
+    out << "Quokka: узел " << (config.name.empty() ? "" : config.name + " ") << "(" << identity::short_id(self.id) << ")\n"
+        << "  Сеть:         " << (selected.profile.empty() ? "без сохранения" : selected.profile) << "\n"
+        << "  Свои сервисы: " << services_text(config) << "\n"
+        << "  Входящие:     " << (config.max_listeners ? "до " + std::to_string(*config.max_listeners) : "без ограничений") << "\n"
+        << "  Транзит:      " << (config.relay ? "да" : "нет") << "\n"
+        << "  QUIC-порт:    " << app.status().quic_port << "/udp\n";
+    if (!config.public_address.empty()) out << "  Адрес:        " << config.public_address << "\n";
+    out << "\n";
+
+    if (issue_code) {
+        const auto invite = app.node().create_invite(DEFAULT_INVITE_TTL, 1);
+        out << invite_text(invite.code, invite.ttl, invite.uses, invite.host, config);
+    } else {
+        out << "Добавить устройство: quokka invite\n";
+    }
+    // Узел уже принимает соединения, и лог могут писать другие потоки
+    logging::info(out.str());
 }
 
 }
@@ -90,10 +310,20 @@ void print_banner(const CliOptions& opts, const App& app, const identity::Invite
 int main(int argc, char** argv) {
     CliOptions opts;
     try {
-        opts = parse_cli(argc, argv);
-    } catch (const std::exception& e) {
+        const ProfileLoader loader = [](const std::string& requested) -> std::optional<NodeConfig> {
+            const auto file = load_profiles();
+            const std::string name = requested.empty() ? file.default_name : requested;
+            const auto it = file.profiles.find(name);
+            if (it == file.profiles.end()) return std::nullopt;
+            return it->second.config;
+        };
+        opts = parse_cli(argc, argv, loader);
+    } catch (const std::invalid_argument& e) {
         std::cerr << e.what() << "\n\nСправка: quokka --help\n";
         return 2;
+    } catch (const std::exception& e) {
+        std::cerr << "Ошибка: " << e.what() << std::endl;
+        return 1;
     }
     if (opts.command == Command::Help) {
         std::cout << cli_usage();
@@ -102,13 +332,41 @@ int main(int argc, char** argv) {
     if (opts.verbose) logging::set_min_level(logging::Level::Debug);
 
     try {
-        const auto invite = opts.command == Command::Up ? prepare_up(opts) : prepare_join(opts);
+        Selected selected;
+        switch (opts.command) {
+        case Command::List:
+            print_list();
+            return 0;
+        case Command::Invite:
+            return run_invite(opts);
+        case Command::Status:
+            return run_status();
+        case Command::Menu: {
+            const std::string name = choose_profile();
+            if (name.empty()) {
+                std::cout << cli_usage();
+                return 0;
+            }
+            selected = select_saved(name, load_profiles().profiles.at(name).config);
+            break;
+        }
+        case Command::Connect:
+            selected = select_saved(opts.profile, opts.config);
+            break;
+        case Command::Join:
+            selected = select_join(opts);
+            break;
+        default:
+            selected = select_up(opts);
+            break;
+        }
+
         const auto self = identity::load_or_create_identity(identity::state_dir());
-        if (opts.config.name.empty()) opts.config.name = default_name();
+        if (selected.config.name.empty()) selected.config.name = default_name();
         raise_file_limit();
 
-        App app(opts.config, identity::network_keys(invite), self);
-        print_banner(opts, app, invite, self);
+        App app(selected.config, selected.network, self);
+        print_banner(selected.config, app, self, selected, selected.created);
         app.start();
 
         boost::asio::io_context signals_io;

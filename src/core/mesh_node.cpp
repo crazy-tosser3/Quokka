@@ -1,6 +1,7 @@
 #include "core/mesh_node.hpp"
 
 #include "core/log.hpp"
+#include "core/pake.hpp"
 #include "core/quic_runtime.hpp"
 #include "core/tcp_bridge.hpp"
 
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -29,6 +31,7 @@ constexpr auto HEADER_TIMEOUT = std::chrono::seconds(10);
 constexpr auto LINK_SILENCE_LIMIT = std::chrono::seconds(4);
 constexpr std::size_t MAX_PENDING_DATAGRAMS = 32;
 constexpr std::size_t MAX_SESSIONS_PER_PEER = 16;
+constexpr uint32_t MAX_INVITE_TTL_SECONDS = 24 * 60 * 60;
 
 int64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -174,12 +177,13 @@ private:
 
 }
 
-MeshNode::MeshNode(boost::asio::io_context& io, const NodeConfig& config, Stats& stats,
+MeshNode::MeshNode(boost::asio::io_context& io, const NodeConfig& config, Stats& stats, const identity::Invite& network,
                    const identity::NetworkKeys& keys, const identity::NodeIdentity& self)
     : io_(io),
       config_(config),
       stats_(stats),
       self_(self),
+      pairing_(network),
       sessions_{io, *this, keys.link_pin},
       db_(self.id),
       originate_timer_(io),
@@ -210,7 +214,8 @@ MeshNode::MeshNode(boost::asio::io_context& io, const NodeConfig& config, Stats&
 
     if (config_.discovery) {
         protocol::Beacon beacon{quic_port_, self_.id};
-        beacon_sender_.emplace(io_, config_.multicast_ip, config_.discovery_port, beacon, keys.discovery_key);
+        beacon_sender_.emplace(io_, config_.multicast_ip, config_.discovery_port, beacon, keys.discovery_key,
+                               [this] { return pairing_.active(); });
         beacon_receiver_.emplace(io_, config_.multicast_ip, config_.discovery_port, keys.discovery_key,
             [this](const boost::asio::ip::address& address, const protocol::Beacon& found) {
                 on_beacon(address, found);
@@ -251,11 +256,12 @@ void MeshNode::start_listener() {
     if (QUIC_FAILED(quic::api->ListenerOpen(quic::registration, MeshNode::listener_callback, this, &quic_listener_))) {
         throw std::runtime_error("Не удалось создать QUIC-listener");
     }
-    const auto start_on = [this](uint16_t port) {
+    const QUIC_BUFFER alpns[] = {quic::alpn(), quic::pairing_alpn()};
+    const auto start_on = [this, &alpns](uint16_t port) {
         QUIC_ADDR addr{};
         QuicAddrSetFamily(&addr, QUIC_ADDRESS_FAMILY_INET);
         QuicAddrSetPort(&addr, port);
-        return QUIC_SUCCEEDED(quic::api->ListenerStart(quic_listener_, &quic::alpn(), 1, &addr));
+        return QUIC_SUCCEEDED(quic::api->ListenerStart(quic_listener_, alpns, 2, &addr));
     };
     if (!start_on(config_.quic_port)) {
         // На одной машине может работать несколько узлов: порт сообщается в маяке
@@ -277,6 +283,12 @@ void MeshNode::start_listener() {
 QUIC_STATUS QUIC_API MeshNode::listener_callback(HQUIC, void* context, QUIC_LISTENER_EVENT* event) {
     auto* node = static_cast<MeshNode*>(context);
     if (event->Type == QUIC_LISTENER_EVENT_NEW_CONNECTION) {
+        const QUIC_NEW_CONNECTION_INFO& info = *event->NEW_CONNECTION.Info;
+        const QUIC_BUFFER& pairing = quic::pairing_alpn();
+        if (info.NegotiatedAlpnLength == pairing.Length &&
+            std::memcmp(info.NegotiatedAlpn, pairing.Buffer, pairing.Length) == 0) {
+            return node->pairing_.accept(event->NEW_CONNECTION.Connection);
+        }
         return QuicSession::accept(node->sessions_, event->NEW_CONNECTION.Connection);
     }
     return QUIC_STATUS_NOT_SUPPORTED;
@@ -677,6 +689,8 @@ void MeshNode::originate() {
     info.sequence = sequence_;
     info.name = config_.name;
     info.services = config_.services;
+    info.no_transit = !config_.relay;
+    info.public_address = config_.public_address;
     for (const auto& [id, link] : links_by_id_) {
         if (link->usable && info.neighbors.size() < routing::MAX_NEIGHBORS) info.neighbors.push_back(id);
     }
@@ -771,7 +785,7 @@ void MeshNode::on_stream_header(const QuicByteStream::Ref& stream, const protoco
 
 void MeshNode::relay_stream(const QuicByteStream::Ref& stream, const protocol::StreamHeader& header,
                             std::vector<uint8_t>&& rest) {
-    const auto link = header.ttl > 1 ? next_hop(header.dst) : nullptr;
+    const auto link = header.ttl > 1 && config_.relay ? next_hop(header.dst) : nullptr;
     auto next = link ? QuicByteStream::open(io_, link->session->handle(), false) : nullptr;
     if (!next) {
         stream->set_handler(nullptr);
@@ -819,6 +833,22 @@ bool MeshNode::on_channel_request(const SecureChannel::Ref& channel, const std::
         bridge->set_channel(channel);
         channel->set_callbacks(bridge->callbacks());
         bridge->connect_target(config_.services[index].port);
+        return true;
+    }
+
+    if (request[0] == protocol::CHANNEL_INVITE && request.size() == 1 + 4 + 2 + 11) {
+        // Код выдал другой участник, а новому устройству нужен узел, доступный извне
+        if (config_.public_address.empty()) return false;
+        const uint32_t ttl = (uint32_t(request[1]) << 24) | (uint32_t(request[2]) << 16) |
+                             (uint32_t(request[3]) << 8) | uint32_t(request[4]);
+        const auto uses = static_cast<unsigned>((request[5] << 8) | request[6]);
+        const auto code = pake::normalize_code(std::string(request.begin() + 7, request.end()));
+        if (!code || ttl == 0 || ttl > MAX_INVITE_TTL_SECONDS || uses == 0) return false;
+        pairing_.add(*code, std::chrono::seconds(ttl), uses);
+        logging::info("[Сеть] Узел ", describe(channel->peer()), " выдал код приглашения через этот узел");
+        SecureChannel::Callbacks callbacks;
+        callbacks.on_fin = [channel] { channel->finish(); };
+        channel->set_callbacks(std::move(callbacks));
         return true;
     }
 
@@ -1114,7 +1144,7 @@ void MeshNode::on_routed_datagram(std::vector<uint8_t>&& pkt) {
     if (!header) return;
 
     if (header->dst != self_.id) {
-        if (header->ttl <= 1) return;
+        if (header->ttl <= 1 || !config_.relay) return;
         const auto link = next_hop(header->dst);
         if (!link) return;
         pkt[1] = header->ttl - 1;
@@ -1160,6 +1190,77 @@ void MeshNode::on_session_inner(UdpSession& session, const std::vector<uint8_t>&
         ++stats_.udp_packets_received;
         proxy->second.udp->on_reply(header->flow, payload, length);
     }
+}
+
+// --- Приглашения и статус ---
+
+MeshNode::InviteInfo MeshNode::create_invite(std::chrono::seconds ttl, unsigned uses) {
+    const auto issued = pairing_.issue(ttl, uses);
+    InviteInfo info{issued.code, ttl, uses, config_.public_address};
+    if (!info.host.empty()) return info;
+
+    // Этот узел может быть за NAT: тогда код нужно передать тем, до кого можно дотянуться.
+    // Новому устройству подойдёт любой из них.
+    const auto seconds = static_cast<uint32_t>(ttl.count());
+    std::vector<uint8_t> request{protocol::CHANNEL_INVITE, uint8_t(seconds >> 24), uint8_t(seconds >> 16), uint8_t(seconds >> 8),
+                                 uint8_t(seconds), uint8_t(uses >> 8), uint8_t(uses)};
+    request.insert(request.end(), issued.code.begin(), issued.code.end());
+    for (const auto& [id, route] : routes_) {
+        const auto* node = db_.find(id);
+        if (!node || node->public_address.empty()) continue;
+        SecureChannel::Ref* holder = new SecureChannel::Ref();
+        SecureChannel::Callbacks callbacks;
+        callbacks.on_ready = [holder] { if (*holder) (*holder)->finish(); };
+        callbacks.on_closed = [holder](bool) { delete holder; };
+        *holder = open_channel(id, request, std::move(callbacks));
+        if (!*holder) {
+            delete holder;
+            continue;
+        }
+        info.host = node->public_address;
+    }
+    return info;
+}
+
+std::string MeshNode::status_text() const {
+    std::ostringstream out;
+    out << "Узел:   " << (config_.name.empty() ? "" : config_.name + " ") << "(" << identity::short_id(self_.id) << ")\n"
+        << "QUIC:   " << quic_port_ << "/udp\n";
+    if (!config_.public_address.empty()) out << "Адрес:  " << config_.public_address << "\n";
+    out << "Транзит: " << (config_.relay ? "да" : "нет") << ", сейчас потоков " << stats_.relayed_streams.load() << "\n\n";
+
+    if (config_.services.empty()) {
+        out << "Свои сервисы: нет\n";
+    } else {
+        out << "Свои сервисы:";
+        for (const Service& service : config_.services) out << " " << to_string(service.proto) << " " << service.port;
+        out << "\n";
+    }
+    out << "\nОткрыто здесь:\n";
+    if (proxies_.empty()) out << "  ничего\n";
+    for (const auto& [key, proxy] : proxies_) {
+        out << "  127.0.0.1:" << proxy.local_port << " -> " << to_string(proxy.service.proto) << " " << proxy.service.port
+            << " на узле " << describe(proxy.owner) << "\n";
+    }
+    out << "\nУзлы сети (" << routes_.size() << "):\n";
+    if (routes_.empty()) out << "  никого не видно\n";
+    for (const auto& [id, route] : routes_) {
+        out << "  " << describe(id);
+        if (route.hops == 1) {
+            out << ": напрямую";
+            const auto link = links_by_id_.find(id);
+            if (link != links_by_id_.end() && link->second->rtt_us.load() >= 0) {
+                out << ", " << link->second->rtt_us.load() / 1000 << " мс";
+            }
+        } else {
+            out << ": через " << route.hops - 1 << " промежуточных";
+        }
+        if (const auto* info = db_.find(id)) {
+            for (const Service& service : info->services) out << ", " << to_string(service.proto) << " " << service.port;
+        }
+        out << "\n";
+    }
+    return out.str();
 }
 
 #ifdef QUOKKA_TEST_HOOKS

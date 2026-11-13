@@ -1,6 +1,8 @@
 // Юнит-тесты без сети: код приглашения, ключи, Noise, карта сети, файлы секретов, разбор протокола.
+#include "app/profiles.hpp"
 #include "core/identity.hpp"
 #include "core/noise.hpp"
+#include "core/pake.hpp"
 #include "core/protocol.hpp"
 #include "core/routing.hpp"
 
@@ -137,12 +139,12 @@ void test_state_files() {
     CHECK(throws([&] { identity::load_or_create_identity(dir); }));
     fs::remove(path);
 
-    const auto invite = sample_invite();
-    CHECK(!identity::load_saved_invite(dir).has_value());
-    identity::save_invite(dir, invite);
-    const auto saved = identity::load_saved_invite(dir);
-    CHECK(saved && saved->secret == invite.secret);
-    CHECK(::stat((dir / "network.invite").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+    // Запись атомарна, права всегда 0600, даже если файла не было
+    identity::write_private_file(dir / "any.secret", "data");
+    CHECK(::stat((dir / "any.secret").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+    const auto read_back = identity::read_private_file(dir / "any.secret");
+    CHECK(read_back && *read_back == "data");
+    CHECK(!identity::read_private_file(dir / "missing").has_value());
 
     fs::remove_all(dir);
 }
@@ -276,6 +278,211 @@ void test_replay_window() {
     // Сдвиг окна очищает старые биты: новый счётчик в той же ячейке проходит
     CHECK(window.accept(10000 + 2048));
     CHECK(!window.accept(10000 + 2048));
+}
+
+// --- Короткие коды и SPAKE2 ---
+
+void test_short_codes() {
+    const std::string code = pake::generate_code();
+    CHECK(code.size() == 11 && code[3] == '-' && code[7] == '-');
+    CHECK(pake::generate_code() != code);
+    CHECK(pake::normalize_code(code) == code);
+
+    // Как угодно набранный код приводится к одному виду
+    std::string messy;
+    for (const char c : code) {
+        if (c != '-') messy += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    CHECK(pake::normalize_code(messy) == code);
+    CHECK(pake::normalize_code("  " + code + "\n") == code);
+
+    // Опечатка почти всегда ловится сразу и не тратит попытку на узле
+    int caught = 0;
+    int total = 0;
+    for (std::size_t i = 0; i < code.size(); ++i) {
+        if (code[i] == '-') continue;
+        std::string typo = code;
+        typo[i] = code[i] == 'A' ? 'B' : 'A';
+        ++total;
+        if (!pake::normalize_code(typo)) ++caught;
+    }
+    CHECK(caught >= total - 2);
+
+    CHECK(!pake::normalize_code("").has_value());
+    CHECK(!pake::normalize_code("ABC-DEF").has_value());
+    CHECK(!pake::normalize_code("quokka2abcdefghjk").has_value());
+    CHECK(!pake::normalize_code(code + "A").has_value());
+    CHECK(!pake::normalize_code("АБВ-ГДЕ-ЖЗИ").has_value());
+}
+
+void test_spake2() {
+    const std::string code = "ABC-DEF-GHJ";
+    pake::Spake2 client(true, code);
+    pake::Spake2 server(false, code);
+    const auto a = client.finish(server.message().data(), server.message().size());
+    const auto b = server.finish(client.message().data(), client.message().size());
+    CHECK(a && b);
+    CHECK(a->encryption == b->encryption);
+    CHECK(a->confirm_client == b->confirm_client && a->confirm_server == b->confirm_server);
+    CHECK(a->encryption != a->confirm_client && a->confirm_client != a->confirm_server);
+
+    // Каждый запуск даёт новые ключи и новые сообщения, хотя код тот же
+    pake::Spake2 client2(true, code);
+    CHECK(client2.message() != client.message());
+    const auto c = client2.finish(server.message().data(), server.message().size());
+    CHECK(c && c->encryption != a->encryption);
+
+    // Разные коды: подтверждение не сходится
+    pake::Spake2 wrong(true, "ZZZ-ZZZ-ZZZ");
+    const auto w = wrong.finish(server.message().data(), server.message().size());
+    const auto s = server.finish(wrong.message().data(), wrong.message().size());
+    CHECK(w && s);
+    CHECK(w->encryption != s->encryption);
+    const auto confirm = pake::confirmation(s->confirm_server);
+    CHECK(!pake::confirmation_matches(w->confirm_server, confirm.data(), confirm.size()));
+    CHECK(pake::confirmation_matches(s->confirm_server, confirm.data(), confirm.size()));
+
+    // Сообщения не выдают код: сервер с тем же кодом каждый раз шлёт другое
+    pake::Spake2 server2(false, code);
+    CHECK(server2.message() != server.message());
+
+    // Стороны не перепутаны: два клиента с одним кодом не договорятся
+    pake::Spake2 other_client(true, code);
+    const auto mirrored = client.finish(other_client.message().data(), other_client.message().size());
+    const auto mirrored2 = other_client.finish(client.message().data(), client.message().size());
+    CHECK(!mirrored || !mirrored2 || mirrored->encryption != mirrored2->encryption);
+
+    // Мусор вместо точки, точка не на кривой
+    std::vector<uint8_t> garbage(pake::POINT_SIZE, 0x42);
+    CHECK(!client.finish(garbage.data(), garbage.size()).has_value());
+    garbage[0] = 0x04;
+    CHECK(!client.finish(garbage.data(), garbage.size()).has_value());
+    CHECK(!client.finish(garbage.data(), 10).has_value());
+    auto tampered = server.message();
+    tampered[20] ^= 1;
+    CHECK(!client.finish(tampered.data(), tampered.size()).has_value());
+}
+
+// --- Файл настроек ---
+
+void test_config_values() {
+    NodeConfig config;
+    parse_open(config, "8000");
+    parse_open(config, "home:22=2222");
+    parse_open(config, "all");
+    CHECK(config.open_rules.size() == 3);
+    CHECK(config.open_rules[1].node == "home" && config.open_rules[1].port == 22 && config.open_rules[1].local_port == 2222);
+    CHECK(config.open_rules[2].port == 0);
+    parse_open(config, "8000");
+    CHECK(config.open_rules.size() == 3);  // без повторов
+
+    parse_peer(config, "vps.example.com");
+    parse_peer(config, "1.2.3.4:555");
+    CHECK(config.peers.size() == 2 && config.peers[0].port == 30002 && config.peers[1].port == 555);
+    parse_peer(config, "1.2.3.4:555");
+    CHECK(config.peers.size() == 2);
+
+    CHECK(is_valid_profile_name("home-1_x"));
+    CHECK(!is_valid_profile_name(""));
+    CHECK(!is_valid_profile_name("a b"));
+    CHECK(!is_valid_profile_name("../x"));
+    CHECK(!is_valid_profile_name("a]\ncode = \"x\""));
+}
+
+void test_config_file() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("quokka-cfg-" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    ::setenv("QUOKKA_HOME", dir.c_str(), 1);
+
+    CHECK(load_profiles().profiles.empty());
+
+    const std::string code = identity::encode_invite(sample_invite());
+    Profile profile;
+    profile.code = code;
+    add_service(profile.config, ServiceProto::Tcp, 22);
+    add_service(profile.config, ServiceProto::Udp, 27015);
+    parse_peer(profile.config, "vps.example.com:4433");
+    parse_open(profile.config, "server:8000=9000");
+    profile.config.name = "laptop";
+    profile.config.relay = false;
+    profile.config.discovery = false;
+    profile.config.max_listeners = 8;
+    profile.config.quic_port = 1234;
+    profile.config.quic_port_explicit = true;
+    profile.config.public_address = "me.example.com";
+    save_profile("home", profile, true);
+
+    // Всё, что записали, читается обратно
+    auto file = load_profiles();
+    CHECK(file.default_name == "home");
+    const auto& loaded = file.profiles.at("home");
+    CHECK(loaded.code == code && loaded.config.name == "laptop");
+    CHECK(loaded.config.services == profile.config.services);
+    CHECK(loaded.config.peers.size() == 1 && loaded.config.peers[0].host == "vps.example.com" && loaded.config.peers[0].port == 4433);
+    CHECK(loaded.config.open_rules.size() == 1 && loaded.config.open_rules[0].node == "server" && loaded.config.open_rules[0].local_port == 9000);
+    CHECK(!loaded.config.relay && !loaded.config.discovery);
+    CHECK(loaded.config.max_listeners == std::size_t{8});
+    CHECK(loaded.config.quic_port == 1234 && loaded.config.quic_port_explicit);
+    CHECK(loaded.config.public_address == "me.example.com");
+
+    struct stat st{};
+    CHECK(::stat(config_path().c_str(), &st) == 0 && (st.st_mode & 0777) == 0600);
+
+    // Сохранение другой сети не трогает комментарии и чужие секции
+    {
+        auto text = *identity::read_private_file(config_path());
+        text = "# мой комментарий\n" + text;
+        identity::write_private_file(config_path(), text);
+    }
+    Profile second;
+    second.code = code;
+    save_profile("work", second, false);
+    save_profile("work", second, false);
+    {
+        const auto text = *identity::read_private_file(config_path());
+        CHECK(text.find("# мой комментарий") != std::string::npos);
+        CHECK(text.find("[network.work]") == text.rfind("[network.work]"));  // не задвоилось
+    }
+    file = load_profiles();
+    CHECK(file.profiles.size() == 2 && file.default_name == "home");
+    save_profile("work", second, true);
+    CHECK(load_profiles().default_name == "work");
+    CHECK(load_profiles().profiles.at("home").config.max_listeners == std::size_t{8});
+
+    // Ошибки в файле: понятные, с номером строки
+    const auto rejects = [&](const std::string& text, const std::string& expected) {
+        identity::write_private_file(config_path(), text);
+        try {
+            load_profiles();
+            return false;
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what()).find(expected) != std::string::npos;
+        }
+    };
+    const std::string head = "[network.a]\ncode = \"" + code + "\"\n";
+    CHECK(rejects(head + "tpc = [22]\n", "строка 3"));
+    CHECK(rejects(head + "tpc = [22]\n", "tpc"));
+    CHECK(rejects(head + "tcp = 22\n", "массив"));
+    CHECK(rejects(head + "tcp = [99999]\n", "неверное значение"));
+    CHECK(rejects(head + "relay = \"да\"\n", "true"));
+    CHECK(rejects(head + "name = \"x\n", "не закрыта"));
+    CHECK(rejects(head + "open = [\"8000\"\n", "не закрыт"));
+    CHECK(rejects("[network.a]\ncode = \"мусор\"\n", "повреждён"));
+    CHECK(rejects("[network.a]\nname = \"x\"\n", "нет code"));
+    CHECK(rejects("[other]\n", "network"));
+    CHECK(rejects("default = \"нет\"\n", "неизвестную сеть"));
+
+    // Допускаются комментарии и пустые строки
+    identity::write_private_file(config_path(), "# заголовок\n\n" + head + "tcp = [22, 80] # веб\n\n");
+    CHECK(load_profiles().profiles.at("a").config.services.size() == 2);
+
+    // Файл с ключами, доступный другим, не читается
+    ::chmod(config_path().c_str(), 0644);
+    CHECK(throws([&] { load_profiles(); }));
+
+    ::unsetenv("QUOKKA_HOME");
+    fs::remove_all(dir);
 }
 
 // --- Карта сети ---
@@ -428,6 +635,23 @@ void test_routes() {
     routes = with_bypass.compute_routes({});
     CHECK(routes.empty());
 
+    // Узел без транзита достижим, но через него пути нет
+    routing::Database no_transit(ids);
+    const auto add_info = [&](const TestNode& node, std::vector<identity::NodeId> neighbors, bool transit) {
+        routing::NodeInfo info;
+        info.signing_key = node.identity.signing_public;
+        info.static_key = node.identity.static_key.public_key;
+        info.sequence = 1;
+        info.neighbors = std::move(neighbors);
+        info.no_transit = !transit;
+        const auto encoded = routing::encode_node_info(info, node.identity);
+        no_transit.insert(encoded.data(), encoded.size(), now);
+    };
+    add_info(a, {ids, idb}, false);
+    add_info(b, {ida}, true);
+    routes = no_transit.compute_routes({ida});
+    CHECK(routes.contains(ida) && !routes.contains(idb));
+
     // Цикл в карте не вешает расчёт
     routing::Database cycle(ids);
     const auto c1 = a.encode(1, {ids, idb});
@@ -516,6 +740,10 @@ int main() {
     test_noise_rejects_tampering();
     test_seal_open();
     test_replay_window();
+    test_short_codes();
+    test_spake2();
+    test_config_values();
+    test_config_file();
     test_node_info_signature();
     test_database_updates();
     test_routes();

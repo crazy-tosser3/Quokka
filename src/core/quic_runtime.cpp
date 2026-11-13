@@ -1,5 +1,6 @@
 #include "core/quic_runtime.hpp"
 
+#include "core/pairing.hpp"
 #include "core/protocol.hpp"
 
 #include <cstring>
@@ -13,6 +14,7 @@ const QUIC_API_TABLE* api = nullptr;
 HQUIC registration = nullptr;
 HQUIC client_configuration = nullptr;
 HQUIC server_configuration = nullptr;
+HQUIC pairing_configuration = nullptr;
 
 namespace {
 
@@ -27,6 +29,7 @@ constexpr char PKCS12_PASSWORD[] = "quokka";
 void close_all() {
     if (client_configuration) { api->ConfigurationClose(client_configuration); client_configuration = nullptr; }
     if (server_configuration) { api->ConfigurationClose(server_configuration); server_configuration = nullptr; }
+    if (pairing_configuration) { api->ConfigurationClose(pairing_configuration); pairing_configuration = nullptr; }
     if (registration)  { api->RegistrationClose(registration);   registration = nullptr; }
     if (api)           { MsQuicClose(api);                       api = nullptr; }
 }
@@ -41,7 +44,15 @@ const QUIC_BUFFER& alpn() {
     return buffer;
 }
 
-Runtime::Runtime(const std::vector<uint8_t>& pkcs12) {
+const QUIC_BUFFER& pairing_alpn() {
+    static const QUIC_BUFFER buffer = {
+        sizeof(protocol::PAIRING_ALPN) - 1,
+        reinterpret_cast<uint8_t*>(const_cast<char*>(protocol::PAIRING_ALPN))
+    };
+    return buffer;
+}
+
+Runtime::Runtime(const std::vector<uint8_t>& pkcs12, const std::vector<uint8_t>& pairing_pkcs12) {
     if (api) throw std::runtime_error("MsQuic runtime is already initialized");
 
     try {
@@ -98,6 +109,21 @@ Runtime::Runtime(const std::vector<uint8_t>& pkcs12) {
         };
         open_configuration(client_configuration, QUIC_CREDENTIAL_FLAG_CLIENT);
         open_configuration(server_configuration, QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION);
+
+        // При входе новое устройство ещё ничего не знает о сети, поэтому сертификат случайный:
+        // подлинность подтверждается только знанием кода в SPAKE2
+        const QUIC_SETTINGS pairing_settings = pairing::quic_settings();
+        status = api->ConfigurationOpen(registration, &pairing_alpn(), 1, &pairing_settings, sizeof(pairing_settings),
+                                        nullptr, &pairing_configuration);
+        if (QUIC_FAILED(status)) fail("ConfigurationOpen", status);
+        QUIC_CERTIFICATE_PKCS12 pairing_cert{};
+        pairing_cert.Asn1Blob = pairing_pkcs12.data();
+        pairing_cert.Asn1BlobLength = static_cast<uint32_t>(pairing_pkcs12.size());
+        pairing_cert.PrivateKeyPassword = PKCS12_PASSWORD;
+        cred_config.CertificatePkcs12 = &pairing_cert;
+        cred_config.Flags = QUIC_CREDENTIAL_FLAG_NONE;
+        status = api->ConfigurationLoadCredential(pairing_configuration, &cred_config);
+        if (QUIC_FAILED(status)) fail("ConfigurationLoadCredential", status);
     } catch (...) {
         close_all();
         throw;

@@ -72,7 +72,10 @@ std::filesystem::path state_dir();
 
 // Бросают std::runtime_error, если файл доступен другим пользователям
 NodeIdentity load_or_create_identity(const std::filesystem::path& dir);
-std::optional<Invite> load_saved_invite(const std::filesystem::path& dir);
-void save_invite(const std::filesystem::path& dir, const Invite& invite);
+
+// Файлы с секретами: как и ssh, отказываемся читать доступное кому-то ещё.
+// nullopt, если файла нет. Запись атомарна, права всегда 0600.
+std::optional<std::string> read_private_file(const std::filesystem::path& path);
+void write_private_file(const std::filesystem::path& path, std::string_view content);
 
 }

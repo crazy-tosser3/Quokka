@@ -29,6 +29,8 @@ struct NodeInfo {
     std::string name;
     std::vector<NodeId> neighbors;
     std::vector<Service> services;
+    bool no_transit{false};       // узел не передаёт чужой трафик
+    std::string public_address;   // адрес для входа новых устройств; пусто, если недоступен извне
 
     NodeId id() const { return identity::node_id_of(signing_key); }
 };

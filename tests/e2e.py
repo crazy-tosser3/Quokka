@@ -2,10 +2,13 @@
 """End-to-end проверка реальных бинарников: mesh из нескольких узлов на одной машине.
 Топология задаётся через --no-discovery и --peer: так два узла не видят друг друга напрямую,
 как если бы они были далеко. Запуск: e2e.py <quokka> <rogue_client> <quokka_evil>"""
+import hashlib
 import os
+import pty
 import random
 import re
 import resource
+import select
 import shutil
 import socket
 import subprocess
@@ -62,8 +65,18 @@ class Node:
         return False
 
     def invite(self):
-        assert self.wait_for("quokka join "), self.text()
-        return self.text().split("quokka join ")[1].split()[0]
+        """Постоянный ключ сети: сценариям важна топология, а не способ входа."""
+        assert self.wait_for("QUIC-порт"), self.text()
+        return self.cli("invite", "--full").stdout.strip()
+
+    def short_code(self):
+        """Короткий код из баннера нового узла."""
+        assert self.wait_for("Код приглашения: "), self.text()
+        return self.text().split("Код приглашения: ")[1].split()[0]
+
+    def cli(self, *args):
+        return subprocess.run([QUOKKA] + list(args), capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                              env=dict(os.environ, QUOKKA_HOME=self.home))
 
     def local_port(self, service_port, timeout=15):
         """Какой локальный порт открыт для сервиса с этим номером."""
@@ -238,6 +251,12 @@ def scenario_cli():
     check("join с плохим кодом", r.returncode == 1 and "повреждён" in r.stderr, r.stderr)
     r = run("join")
     check("join без кода и без терминала", r.returncode == 1 and "не указан" in r.stderr, r.stderr)
+    r = run("invite")
+    check("invite без запущенного узла", r.returncode == 1 and "не запущен" in r.stderr, r.stderr)
+    r = run("status")
+    check("status без запущенного узла", r.returncode == 1, r.stderr)
+    r = run("connect", "нет")
+    check("connect к неизвестной сети", r.returncode != 0 and "нет" in r.stderr, r.stderr)
     r = run("up", "--listeners", "0")
     check("--listeners 0 отклонён", r.returncode == 2, r.stderr)
     r = run("up", "--open", "abc")
@@ -638,18 +657,20 @@ def scenario_duplicate_links():
 
 
 def scenario_lifecycle():
-    print("Жизненный цикл кода и личности")
+    print("Жизненный цикл сети и личности")
     home = os.path.join(ROOT, "life-home")
     args = ["up", "--no-discovery"]
     a = Node("life-1", args + ["--port", str(free_port())], home=home)
     first = a.invite()
     first_id = re.search(r"\((\w{8})\)", a.text()).group(1)
+    check("новая сеть сразу даёт короткий код", re.search(r"[0-9A-Z]{3}-[0-9A-Z]{3}-[0-9A-Z]{3}", a.short_code()) is not None)
     a.stop()
     os.remove(a.log_path)
 
     a = Node("life-1", args + ["--port", str(free_port())], home=home)
-    check("код не меняется после перезапуска", a.invite() == first)
+    check("сеть не меняется после перезапуска", a.invite() == first)
     check("идентификатор не меняется", first_id in a.text())
+    check("при перезапуске новый код не выдаётся сам", "Код приглашения" not in a.text() and "quokka invite" in a.text(), a.text())
     a.stop()
     os.remove(a.log_path)
 
@@ -658,15 +679,15 @@ def scenario_lifecycle():
     check("--new-invite создаёт другую сеть", second != first)
     a.stop()
 
-    # Любой участник может пригласить следующего: код один на всю сеть
+    # Постоянный ключ сети: подходит для автоматизации
     px = free_port()
     x, code = start_network("life-x", px)
     b_home = os.path.join(ROOT, "life-b")
     b = Node("life-b", ["join", code] + isolated(free_port(), [px]), home=b_home)
-    check("участник печатает тот же код", b.invite() == code)
+    check("участник знает тот же ключ", b.invite() == code)
     b.stop()
-    again = Node("life-b2", ["join"] + isolated(free_port(), [px]), home=b_home)
-    check("join без кода использует сохранённый", again.wait_for("Сосед подключён"), again.text())
+    again = Node("life-b2", ["connect", "default"], home=b_home)
+    check("сеть запомнилась после join", again.wait_for("Сосед подключён"), again.text())
     again.stop()
     x.stop()
 
@@ -674,6 +695,301 @@ def scenario_lifecycle():
     bad = Node("life-perm", ["up", "--no-discovery", "--port", str(free_port())], home=b_home)
     bad.proc.wait(10)
     check("секрет с широкими правами не читается", bad.proc.returncode == 1 and "chmod 600" in bad.text(), bad.text())
+
+
+def fake_code():
+    """Правильно составленный, но чужой код: контрольный символ проходит, попытка тратится на узле."""
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    data = "".join(random.choice(alphabet) for _ in range(8))
+    digest = hashlib.sha256(b"quokka-short-code-v1" + data.encode()).digest()
+    full = data + alphabet[digest[0] % 32]
+    return "%s-%s-%s" % (full[:3], full[3:6], full[6:])
+
+
+def join_once(name, *args):
+    return subprocess.run([QUOKKA, "join"] + list(args), capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                          env=dict(os.environ, QUOKKA_HOME=os.path.join(ROOT, name)))
+
+
+def join_and_wait(name, code, port, extra=()):
+    """Вход по короткому коду. Возвращает работающий узел или None, если код не приняли."""
+    node = Node(name, ["join", code, "--no-discovery", "--peer", "127.0.0.1:%d" % port, "--name", name] + list(extra))
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if node.proc.poll() is not None:
+            return None if node.proc.returncode != 0 else node
+        if "QUIC-порт" in node.text():
+            return node
+        time.sleep(0.05)
+    raise AssertionError("вход завис: " + node.text())
+
+
+def invite_cmd(node, *args):
+    r = node.cli("invite", *args)
+    match = re.search(r"Код приглашения: (\S+)", r.stdout)
+    assert match, r.stdout + r.stderr
+    return match.group(1), r.stdout
+
+
+def scenario_short_codes():
+    print("Короткие коды приглашения")
+    tcp = TcpEcho()
+    px = free_port()
+    x = Node("code-x", ["up", "--name", "code-x", "--no-discovery", "--port", str(px), "--tcp", str(tcp.port)])
+    first = x.short_code()
+    check("код короткий и читаемый", re.fullmatch(r"[0-9A-Z]{3}-[0-9A-Z]{3}-[0-9A-Z]{3}", first) is not None, first)
+    check("постоянного ключа в баннере нет", "quokka2" not in x.text(), x.text())
+
+    local = free_port()
+    a = join_and_wait("code-a", first.lower().replace("-", ""), px, ["--open", "%d=%d" % (tcp.port, local)])
+    check("вход по коду в любом регистре и без дефисов", a is not None, x.text())
+    check("после входа сеть работает", a is not None and tcp_retry(local, b"paired"))
+    check("устройство получило настоящий ключ сети", a is not None and a.invite() == x.invite())
+    check("секрет не попал в лог устройства", a is not None and x.invite() not in a.text())
+    if a:
+        a.stop()
+
+    # Одноразовость
+    r = join_once("code-reuse", first, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("код нельзя использовать второй раз", r.returncode == 1 and "код" in r.stderr.lower(), r.stdout + r.stderr)
+
+    # Несколько устройств на один код
+    code, output = invite_cmd(x, "--uses", "2")
+    check("invite выводит готовую команду", "quokka join " + code in output, output)
+    b = join_and_wait("code-b", code, px)
+    c = join_and_wait("code-c", code, px)
+    check("код на два устройства впускает двоих", b is not None and c is not None)
+    r = join_once("code-d", code, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("третьего не впускает", r.returncode == 1, r.stdout + r.stderr)
+    for node in (b, c):
+        if node:
+            node.stop()
+
+    # Срок действия
+    code, _ = invite_cmd(x, "--ttl", "1s")
+    time.sleep(1.5)
+    r = join_once("code-exp", code, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("истёкший код не работает", r.returncode == 1, r.stdout + r.stderr)
+
+    # Опечатка ловится сразу, без обращения к узлу
+    code, _ = invite_cmd(x)
+    typo = ("B" if code[0] != "B" else "C") + code[1:]
+    if typo != code:
+        r = join_once("code-typo", typo, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+        check("опечатка в коде опознана", r.returncode == 1, r.stdout + r.stderr)
+
+    # Неверный код не передаёт ключ, настоящий после этого работает
+    r = join_once("code-wrong", fake_code(), "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("неверный код отклонён", r.returncode == 1 and "не подошёл" in r.stderr, r.stdout + r.stderr)
+    check("при неверном коде ключ не сохранён", not os.path.exists(os.path.join(ROOT, "code-wrong", "config.toml")))
+    d = join_and_wait("code-e", code, px)
+    check("настоящий код после неудачной попытки работает", d is not None)
+    if d:
+        d.stop()
+
+    # Перебор: после 10 попыток код сгорает, даже настоящий
+    code, _ = invite_cmd(x)
+    for i in range(10):
+        join_once("code-brute", fake_code(), "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("перебор замечен", x.wait_for("слишком много попыток", timeout=5), x.text())
+    r = join_once("code-after", code, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("после перебора код сгорел", r.returncode == 1, r.stdout + r.stderr)
+
+    # Код чужой сети: узел не подтвердит и ключа своей сети не отдаст
+    other = Node("code-other", ["up", "--no-discovery", "--port", str(free_port())])
+    other_code = other.short_code()
+    r = join_once("code-cross", other_code, "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("код другой сети не подходит", r.returncode == 1, r.stdout + r.stderr)
+    other.stop()
+
+    # Узел без действующих кодов вообще не отвечает на вход
+    r = join_once("code-none", fake_code(), "--no-discovery", "--peer", "127.0.0.1:%d" % px)
+    check("без действующих кодов входа нет", r.returncode == 1 and "недоступен" in r.stderr, r.stdout + r.stderr)
+
+    # Переменная окружения
+    code, _ = invite_cmd(x)
+    node = Node("code-env", ["join", "--no-discovery", "--peer", "127.0.0.1:%d" % px], env={"QUOKKA_INVITE": code})
+    check("код из QUOKKA_INVITE", node.wait_for("QUIC-порт", timeout=15), node.text())
+    node.stop()
+
+    # Управляющий сокет доступен только владельцу, статус показывает сеть
+    sock_path = os.path.join(x.home, "control.sock")
+    check("управляющий сокет только для владельца", os.stat(sock_path).st_mode & 0o077 == 0, oct(os.stat(sock_path).st_mode))
+    status = x.cli("status")
+    check("status показывает узел", status.returncode == 0 and "code-x" in status.stdout and "TCP %d" % tcp.port in status.stdout, status.stdout)
+    x.stop()
+    check("сокет убран при выходе", not os.path.exists(sock_path))
+
+    # Вход в локальной сети: адрес не нужен
+    discovery = free_port()
+    lan = Node("code-lan", ["up", "--discovery-port", str(discovery), "--port", str(free_port())])
+    lan_code = lan.short_code()
+    node = Node("code-lan2", ["join", lan_code, "--discovery-port", str(discovery), "--port", str(free_port())])
+    if node.wait_for("QUIC-порт", timeout=15) and node.proc.poll() is None:
+        check("вход по коду находит узел в локальной сети сам", True)
+        node.stop()
+    else:
+        print("  skip  multicast недоступен в этом окружении: " + node.text()[-200:])
+    lan.stop()
+
+
+def scenario_vps():
+    print("VPS: машины за NAT видят друг друга через публичный узел")
+    tcp = TcpEcho()
+    pv = free_port()
+    public = "127.0.0.1:%d" % pv
+    vps = Node("vps", ["server", "--public", public, "--port", str(pv), "--name", "vps"])
+    code = vps.short_code()
+    check("сервер показывает, куда подключаться", "--peer " + public in vps.text(), vps.text())
+
+    # Домашняя машина: подключается сама, входящие к ней не настроены
+    home = join_and_wait("vps-home", code, pv, ["--tcp", str(tcp.port), "--no-relay"])
+    check("домашняя машина вошла через VPS", home is not None, vps.text())
+
+    # Код можно выдать прямо с домашней машины: узел передаст его на VPS
+    home.wait_for("Сосед подключён", timeout=10)
+    home.wait_for("vps", timeout=10)
+    time.sleep(1)
+    new_code, output = invite_cmd(home)
+    check("код с машины за NAT подсказывает адрес VPS", "--peer " + public in output, output)
+
+    local = free_port()
+    laptop = join_and_wait("vps-laptop", new_code, pv, ["--open", "%d=%d" % (tcp.port, local), "--no-relay"])
+    check("ноутбук вошёл по коду, выданному за NAT", laptop is not None, vps.text())
+    check("сервис домашней машины виден", laptop.wait_for("узла vps-home", timeout=20), laptop.text())
+    check("связь идёт через VPS", "через 1 промежуточных" in laptop.text(), laptop.text())
+    check("TCP через VPS", tcp_retry(local, b"through-vps"))
+    check("TCP 4 МиБ через VPS", tcp_roundtrip(local, os.urandom(4 * 1024 * 1024)))
+
+    status = vps.cli("status")
+    check("VPS видит обе машины", "vps-home" in status.stdout and "vps-laptop" in status.stdout, status.stdout)
+
+    # Перезапуск VPS: всё восстанавливается само
+    vps.kill()
+    check("обрыв замечен", laptop.wait_for("недоступен", timeout=25), laptop.text())
+    vps.start()
+    check("после перезапуска VPS связь вернулась", tcp_retry(local, b"back", timeout=40), laptop.text())
+
+    for node in (laptop, home, vps):
+        node.stop()
+
+
+def scenario_no_relay():
+    print("--no-relay: узел не передаёт чужой трафик")
+    tcp = TcpEcho()
+    pa, pn, pc = free_port(), free_port(), free_port()
+    c, code = start_network("nr-c", pc, ["--tcp", str(tcp.port)])
+    n = add_node("nr-n", code, pn, [pc], ["--no-relay", "--tcp", str(tcp.port)])
+    local = free_port()
+    a = add_node("nr-a", code, pa, [pn], ["--open", "nr-n:%d=%d" % (tcp.port, local)])
+    check("сам узел доступен", tcp_retry(local, b"direct"), a.text())
+    time.sleep(2)
+    check("узел за ним недоступен", "Узел nr-c" not in a.text(), a.text())
+    for node in (a, n, c):
+        node.stop()
+
+
+def scenario_profiles():
+    print("Файл настроек и выбор сети")
+    tcp = TcpEcho()
+    px = free_port()
+    x, code = start_network("prof-x", px, ["--tcp", str(tcp.port)])
+    home = os.path.join(ROOT, "prof-home")
+    local = free_port()
+
+    # Первый вход сохраняет всё необходимое
+    first = Node("prof-1", ["join", code, "--no-discovery", "--peer", "127.0.0.1:%d" % px, "--name", "laptop",
+                            "--open", "%d=%d" % (tcp.port, local), "--save", "work"], home=home)
+    check("сеть подключена", tcp_retry(local, b"saved"), first.text())
+    first.stop()
+
+    listing = Node.cli(first, "list")
+    check("list показывает сеть и путь к файлу", "work" in listing.stdout and "config.toml" in listing.stdout and "laptop" in listing.stdout, listing.stdout)
+    check("list не выводит ключ сети", code not in listing.stdout, listing.stdout)
+    config = os.path.join(home, "config.toml")
+    check("файл настроек только для владельца", os.stat(config).st_mode & 0o777 == 0o600)
+
+    # Подключение по имени без всех аргументов
+    second = Node("prof-2", ["connect", "work"], home=home)
+    check("connect восстанавливает настройки", tcp_retry(local, b"by-name"), second.text())
+    second.stop()
+
+    # quokka без аргументов: единственная сеть запускается сразу
+    third = Node("prof-3", [], home=home)
+    check("quokka без аргументов подключает сеть", tcp_retry(local, b"no-args"), third.text())
+    third.stop()
+
+    # Руками написанный файл со всеми настройками и комментариями
+    with open(config, "a") as f:
+        f.write("""
+# запасная сеть
+[network.lab]
+code = "%s"
+name = "лаборатория"
+peers = ["127.0.0.1:%d"]
+tcp = [%d]
+relay = false   # не передавать чужой трафик
+discovery = false
+port = %d
+listeners = 3
+""" % (code, px, tcp.port, free_port()))
+    lab = Node("prof-4", ["connect", "lab"], home=home)
+    check("рукописная сеть работает", lab.wait_for("Сосед подключён"), lab.text())
+    check("настройки из файла применены", "лаборатория" in lab.text() and "до 3" in lab.text() and "Транзит:      нет" in lab.text(), lab.text())
+    lab.stop()
+
+    # Несколько сетей без терминала: берётся сеть по умолчанию
+    default = Node("prof-5", [], home=home)
+    check("без терминала берётся сеть по умолчанию", default.wait_for("Сеть:         work"), default.text())
+    default.stop()
+
+    # Меню: выбор сети номером в терминале
+    master, slave = pty.openpty()
+    proc = subprocess.Popen([QUOKKA], stdin=slave, stdout=slave, stderr=slave, env=dict(os.environ, QUOKKA_HOME=home))
+    os.close(slave)
+    output = b""
+    deadline = time.time() + 10
+    answered = False
+    while time.time() < deadline and b"QUIC" not in output:
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if ready:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                break
+        if not answered and "Куда подключиться".encode() in output:
+            os.write(master, b"lab\n")
+            answered = True
+    # Терминал нужно читать и при выходе: иначе запись в полный буфер pty заблокирует процесс
+    proc.terminate()
+    deadline = time.time() + 10
+    while proc.poll() is None and time.time() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                break
+    check("из меню узел завершается по SIGTERM", proc.poll() is not None or proc.wait(2) is not None)
+    os.close(master)
+    text = output.decode("utf-8", "replace")
+    check("меню показывает сети", "work" in text and "lab" in text, text)
+    check("меню подключает выбранную", "Сеть:         lab" in text, text)
+
+    # Опечатка в файле: понятная ошибка
+    with open(config, "a") as f:
+        f.write("\n[network.bad]\ncode = \"%s\"\ntpc = [22]\n" % code)
+    r = first.cli("connect", "work")
+    check("опечатка в настройке объяснена", r.returncode != 0 and "tpc" in r.stderr and "строка" in r.stderr, r.stderr)
+
+    # Файл доступен другим: отказ
+    lines = open(config).read().replace('tpc = [22]', '')
+    with open(config, "w") as f:
+        f.write(lines)
+    os.chmod(config, 0o644)
+    r = first.cli("list")
+    check("файл с широкими правами не читается", r.returncode != 0 and "chmod 600" in r.stderr, r.stderr)
+    x.stop()
 
 
 def scenario_backpressure():
@@ -755,8 +1071,8 @@ def main():
     try:
         for scenario in (scenario_cli, scenario_discovery, scenario_every_node_serves, scenario_chain, scenario_failover,
                          scenario_relay_cannot_read, scenario_relay_mitm, scenario_relay_truncate, scenario_member_limits, scenario_outsiders,
-                         scenario_listeners, scenario_duplicate_links, scenario_lifecycle, scenario_backpressure,
-                         scenario_flow_limit):
+                         scenario_listeners, scenario_duplicate_links, scenario_lifecycle, scenario_short_codes, scenario_vps,
+                         scenario_no_relay, scenario_profiles, scenario_backpressure, scenario_flow_limit):
             if not only or scenario.__name__.replace("scenario_", "") in only:
                 scenario()
     finally:

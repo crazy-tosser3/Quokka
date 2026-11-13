@@ -17,7 +17,7 @@
 class BeaconSender {
 public:
     BeaconSender(boost::asio::io_context& io, const std::string& multicast_ip, uint16_t discovery_port,
-                 const protocol::Beacon& beacon, const Aead::Key& key);
+                 const protocol::Beacon& beacon, const Aead::Key& key, std::function<bool()> pairing_active);
 
 private:
     void do_send();
@@ -27,6 +27,7 @@ private:
     boost::asio::steady_timer timer_;
     Aead aead_;
     protocol::Beacon beacon_;
+    std::function<bool()> pairing_active_;
 };
 
 class BeaconReceiver {

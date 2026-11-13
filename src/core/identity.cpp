@@ -27,7 +27,6 @@ constexpr char PKCS12_PASSWORD[] = "quokka";  // блоб живёт тольк�
 
 constexpr char NODE_FILE[] = "node.secret";
 constexpr char NODE_HEADER[] = "quokka-node-v1";
-constexpr char INVITE_FILE[] = "network.invite";
 
 template <class T, void (*Free)(T*)>
 struct Deleter {
@@ -127,6 +126,8 @@ void ensure_dir(const std::filesystem::path& dir) {
                                  std::filesystem::perm_options::replace, ec);
 }
 
+}
+
 // Как и ssh, отказываемся читать секрет, доступный кому-то ещё
 std::optional<std::string> read_private_file(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -166,8 +167,6 @@ void write_private_file(const std::filesystem::path& path, std::string_view cont
         ::unlink(tmp.c_str());
         throw std::runtime_error("Не удалось записать " + path.string());
     }
-}
-
 }
 
 std::string encode_invite(const Invite& invite) {
@@ -389,16 +388,6 @@ NodeIdentity load_or_create_identity(const std::filesystem::path& dir) {
     text += '\n' + to_hex(static_secret.data(), static_secret.size()) + '\n';
     write_private_file(path, text);
     return identity_from_keys(seed, static_secret);
-}
-
-std::optional<Invite> load_saved_invite(const std::filesystem::path& dir) {
-    const auto content = read_private_file(dir / INVITE_FILE);
-    if (!content) return std::nullopt;
-    return decode_invite(*content);
-}
-
-void save_invite(const std::filesystem::path& dir, const Invite& invite) {
-    write_private_file(dir / INVITE_FILE, encode_invite(invite) + "\n");
 }
 
 }

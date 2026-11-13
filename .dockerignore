@@ -11,4 +11,3 @@ src/.gitignore
 *.crt
 *.pem
 tests/__pycache__
-.backup

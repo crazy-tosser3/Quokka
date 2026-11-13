@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/config.hpp"
+#include "core/control.hpp"
 #include "core/identity.hpp"
 #include "core/mesh_node.hpp"
 #include "core/quic_runtime.hpp"
@@ -13,7 +14,7 @@
 
 class App {
 public:
-    App(const NodeConfig& config, const identity::NetworkKeys& keys, const identity::NodeIdentity& self);
+    App(const NodeConfig& config, const identity::Invite& network, const identity::NodeIdentity& self);
     ~App();
 
     App(const App&) = delete;
@@ -24,13 +25,18 @@ public:
     bool running() const { return thread_.joinable(); }
 
     NodeStatus status() const;
+    MeshNode& node() { return *node_; }
     const NodeConfig& config() const { return config_; }
 
 private:
+    App(const NodeConfig& config, const identity::Invite& network, const identity::NodeIdentity& self,
+        const identity::NetworkKeys& keys);
+
     NodeConfig config_;
     Stats stats_;
     quic::Runtime quic_;
     boost::asio::io_context io_;
     std::unique_ptr<MeshNode> node_;
+    std::unique_ptr<ControlServer> control_;
     std::thread thread_;
 };

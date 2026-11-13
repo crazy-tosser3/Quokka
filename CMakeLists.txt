@@ -18,6 +18,8 @@ find_package(msquic CONFIG REQUIRED)
 set(QUOKKA_CORE_SOURCES
         src/core/aead.hpp
         src/core/config.hpp
+        src/core/control.hpp
+        src/core/control.cpp
         src/core/discovery.hpp
         src/core/discovery.cpp
         src/core/identity.hpp
@@ -30,6 +32,10 @@ set(QUOKKA_CORE_SOURCES
         src/core/net_utils.cpp
         src/core/noise.hpp
         src/core/noise.cpp
+        src/core/pake.hpp
+        src/core/pake.cpp
+        src/core/pairing.hpp
+        src/core/pairing.cpp
         src/core/protocol.hpp
         src/core/quic_runtime.hpp
         src/core/quic_runtime.cpp
@@ -48,6 +54,8 @@ set(QUOKKA_CORE_SOURCES
         src/core/udp_tunnel.cpp
         src/app/app.hpp
         src/app/app.cpp
+        src/app/profiles.hpp
+        src/app/profiles.cpp
         src/app/cli.hpp
         src/app/cli.cpp
 )

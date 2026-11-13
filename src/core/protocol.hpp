@@ -14,7 +14,8 @@
 // Формат всего, что передаётся по сети. Описание — docs/ARCHITECTURE.md.
 namespace protocol {
 
-inline constexpr char ALPN[] = "quokka/2";
+inline constexpr char ALPN[] = "quokka/3";
+inline constexpr char PAIRING_ALPN[] = "quokka-pair/1";  // вход в сеть по короткому коду
 
 using identity::NodeId;
 
@@ -172,6 +173,7 @@ inline std::vector<uint8_t> channel_prologue(const NodeId& initiator, const Node
 enum ChannelKind : uint8_t {
     CHANNEL_TCP = 1,  // [вид][сервис]
     CHANNEL_UDP = 2,  // [вид][сессия:4]
+    CHANNEL_INVITE = 3,  // [вид][срок в секундах:4][использований:2][код:11]: код для узла, доступного извне
 };
 
 // --- Маяк поиска (шифруется целиком): "QBCN" + версия + QUIC-порт + идентификатор узла ---
@@ -191,6 +193,25 @@ inline std::string encode_beacon(const Beacon& beacon) {
     out += static_cast<char>(beacon.quic_port & 0xFF);
     out.append(reinterpret_cast<const char*>(beacon.id.data()), beacon.id.size());
     return out;
+}
+
+// Открытый маяк входа: «у меня есть действующий код». Сам код из него узнать нельзя.
+inline constexpr char PAIRING_BEACON_MAGIC[] = "QPAIR1";
+
+inline std::string encode_pairing_beacon(uint16_t quic_port) {
+    std::string out(PAIRING_BEACON_MAGIC);
+    out += static_cast<char>(quic_port >> 8);
+    out += static_cast<char>(quic_port & 0xFF);
+    return out;
+}
+
+inline std::optional<uint16_t> decode_pairing_beacon(const std::string& data) {
+    constexpr std::size_t magic_size = sizeof(PAIRING_BEACON_MAGIC) - 1;
+    if (data.size() != magic_size + 2 || data.compare(0, magic_size, PAIRING_BEACON_MAGIC) != 0) return std::nullopt;
+    const auto port = static_cast<uint16_t>((static_cast<uint8_t>(data[magic_size]) << 8) |
+                                            static_cast<uint8_t>(data[magic_size + 1]));
+    if (port == 0) return std::nullopt;
+    return port;
 }
 
 inline std::optional<Beacon> decode_beacon(const std::string& data) {

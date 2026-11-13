@@ -39,6 +39,8 @@ struct PeerAddress {
 
 struct NodeConfig {
     std::string name;                 // имя узла для людей; не является доказательством личности
+    std::string public_address;       // адрес, по которому узел доступен извне (--public); для приглашений
+    bool relay = true;                // передавать чужой трафик
 
     std::vector<Service> services;    // свои порты, открытые сети
     std::vector<OpenRule> open_rules; // чужие порты, открываемые здесь

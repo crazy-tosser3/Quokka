@@ -9,12 +9,14 @@
 using boost::asio::ip::udp;
 
 BeaconSender::BeaconSender(boost::asio::io_context& io, const std::string& multicast_ip,
-                           uint16_t discovery_port, const protocol::Beacon& beacon, const Aead::Key& key)
+                           uint16_t discovery_port, const protocol::Beacon& beacon, const Aead::Key& key,
+                           std::function<bool()> pairing_active)
     : socket_(io, udp::v4()),
       group_(boost::asio::ip::make_address(multicast_ip), discovery_port),
       timer_(io),
       aead_(key),
-      beacon_(beacon)
+      beacon_(beacon),
+      pairing_active_(std::move(pairing_active))
 {
     // Пакеты должны доходить и до других узлов на этой же машине
     socket_.set_option(boost::asio::ip::multicast::enable_loopback(true));
@@ -23,10 +25,13 @@ BeaconSender::BeaconSender(boost::asio::io_context& io, const std::string& multi
 
 void BeaconSender::do_send() {
     const auto packet = aead_.encrypt(protocol::encode_beacon(beacon_));
+    // Новому устройству ключ маяков ещё неизвестен, поэтому о входе сообщаем открыто
+    const std::string pairing = pairing_active_() ? protocol::encode_pairing_beacon(beacon_.quic_port) : std::string{};
     for (const auto& iface : local_ipv4_interfaces()) {
         boost::system::error_code ec;
         socket_.set_option(boost::asio::ip::multicast::outbound_interface(iface), ec);
         if (!ec) socket_.send_to(boost::asio::buffer(packet), group_, 0, ec);
+        if (!ec && !pairing.empty()) socket_.send_to(boost::asio::buffer(pairing), group_, 0, ec);
         if (ec) logging::debug("[Поиск] Не удалось отправить маяк через ", iface, ": ", ec.message());
     }
 

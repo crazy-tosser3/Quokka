@@ -79,6 +79,9 @@ std::vector<uint8_t> encode_node_info(const NodeInfo& info, const identity::Node
         body.push_back(static_cast<uint8_t>(service.proto));
         put_u16(body, service.port);
     }
+    body.push_back(info.no_transit ? 1 : 0);
+    body.push_back(static_cast<uint8_t>(info.public_address.size()));
+    body.insert(body.end(), info.public_address.begin(), info.public_address.end());
     const auto message = signed_message(body.data(), body.size());
     const auto signature = identity::sign(node, message.data(), message.size());
     body.insert(body.end(), signature.begin(), signature.end());
@@ -116,6 +119,18 @@ std::optional<NodeInfo> decode_node_info(const uint8_t* data, std::size_t size) 
             return std::nullopt;
         }
         service.proto = static_cast<ServiceProto>(proto);
+    }
+    uint8_t flags = 0;
+    uint8_t address_size = 0;
+    if (!reader.u8(flags) || flags > 1 || !reader.u8(address_size) || address_size > MAX_NAME_SIZE * 2) return std::nullopt;
+    info.no_transit = flags == 1;
+    info.public_address.resize(address_size);
+    if (!reader.bytes(reinterpret_cast<uint8_t*>(info.public_address.data()), address_size) ||
+        !std::all_of(info.public_address.begin(), info.public_address.end(), [](char c) {
+            const auto byte = static_cast<unsigned char>(c);
+            return byte > 0x20 && byte < 0x7F;
+        })) {
+        return std::nullopt;
     }
     if (!reader.empty()) return std::nullopt;
 
@@ -206,7 +221,7 @@ std::map<NodeId, Route> Database::compute_routes(const std::vector<NodeId>& dire
         const NodeId current = queue.front();
         queue.pop_front();
         const NodeInfo* info = find(current);
-        if (!info) continue;
+        if (!info || info->no_transit) continue;  // до него дойти можно, через него нельзя
         const Route route = routes[current];
 
         std::vector<NodeId> next = info->neighbors;
